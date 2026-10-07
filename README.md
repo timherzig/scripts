@@ -65,11 +65,15 @@ Each stage is idempotent and can be run on its own with `-t <task>`:
                                                    with its disc number;
                                                    single-disc / unknown
                                                    discs read as disc 1)
-   bucket/d-nn - track title.<ext>                 (loose tracks, e.g. misc/)
+   bucketname/Artist - Title.<ext>                 (loose tracks with no album,
+                                                   e.g. misc/, No Album/)
    ```
 
    Names (and folder names) are lowercased — the tags keep their original case,
-   and players/CDJs display from the tags. Track numbers are zero-padded to the
+   and players/CDJs display from the tags. Loose tracks in no-album buckets
+   (`misc/`, `No Album/`, `Singles/`, ...) keep `Artist - Title` instead of a
+   disc-prefixed number, since there is no album to scope the title. Track
+   numbers are zero-padded to the
    width of the widest number (min 2). Every file is prefixed with its disc
    number (from the `discnumber` tag, then the disc folder name, defaulting to
    `1` when there is no disc at all): a plain single-disc album is
@@ -82,7 +86,9 @@ Each stage is idempotent and can be run on its own with `-t <task>`:
    FAT32/exFAT (`<>:"|?*`), and case drift is fixed even on
    case-insensitive filesystems (a same-inode sibling with the wrong case is
    renamed via a temp name). Empty folders are pruned. Every change is logged
-   to `rename_report.txt`.
+   to `rename_report.txt` and accumulated in `rename_history.txt` (append-only
+   across runs), so a filename from *any* earlier state can be traced to its
+   current one.
 
 5. **`sync_library`** – converts any FLAC that has no (or a stale) MP3/AIFF
    twin. Re-runs are no-ops once mtimes are aligned.
@@ -92,10 +98,13 @@ Each stage is idempotent and can be run on its own with `-t <task>`:
    twin (both album folders and loose tracks).
 
 7. **`relocate_rekordbox`** – repoints the Rekordbox XML collection from MP3 to
-   AIFF. Matching strategies in order: exact path mirror → normalized match via
-   the FLAC tree (with fuzzy fallback, both guarded by `same_audio` so a
-   different recording is never linked) → artist+title lookup against the AIFF
-   tags. Track attributes (Name, Artist, Album, Genre, Year) are refreshed from
+   AIFF. Matching strategies in order: rename-history translation (each track's path
+   is traced through `rename_history.txt` — covering *every* rename from any
+   earlier run, incl. disc-folder flattening and compilation
+   `NN - Artist - Title` rewrites — straight to its current AIFF twin) →
+   exact path mirror → normalized match via the FLAC tree (with fuzzy
+   fallback, both guarded by `same_audio` so a different recording is never
+   linked) → artist+title lookup against the AIFF tags. Track attributes (Name, Artist, Album, Genre, Year) are refreshed from
    the target AIFF's tags; `TrackID` (and therefore playlists) is untouched.
    Tracks that cannot be matched are written to `rekordbox_unmatched.txt`
    instead of being silently dropped.
@@ -188,7 +197,8 @@ development:
 * Track titles adopted from MusicBrainz may differ cosmetically from the current
   file names (feat. credits dropped, curly apostrophes, capitalization), and
   lowercase renames change every file/folder name once. Both are intended: the
-  file name follows the canonical tag. After a rename-heavy run, some
-  Rekordbox tracks may end up in the unmatched report because their *old*
-  location no longer matches — review `rekordbox_unmatched.txt` and fix those by
-  hand (or re-export the collection after the renames are done).
+  file name follows the canonical tag. Re-running `relocate_rekordbox` against
+  the *original* export keeps working after rename-heavy runs: every rename is
+  traced through `rename_history.txt`, so the current AIFF path is found for all
+  renamed tracks. Anything still unmatched lands in `rekordbox_unmatched.txt`
+  for manual review.

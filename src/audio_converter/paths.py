@@ -21,6 +21,7 @@ MANIFEST_PATH = MUSIC_ROOT / "lossy_sourced_manifest.json"
 MB_CACHE_PATH = MUSIC_ROOT / ".musicbrainz_cache.json"
 MISSING_REPORT_PATH = MUSIC_ROOT / "missing_lossless_report.txt"
 RENAME_REPORT_PATH = MUSIC_ROOT / "rename_report.txt"
+RENAME_HISTORY_PATH = MUSIC_ROOT / "rename_history.txt"
 
 # Rekordbox XML export (override with REKORDBOX_XML / REKORDBOX_XML_OUT)
 REKORDBOX_XML_IN = Path(

@@ -6,6 +6,8 @@ Canonical scheme:
                                                      with its disc number;
                                                      single-disc / unknown
                                                      discs read as disc 1)
+    bucketname/Artist - Title.<ext>                 (loose tracks with no album,
+                                                     e.g. misc/, No Album/)
 
 By default folder names *and* file names are lowercased (the tags keep their
 original case, and CDJ/player displays come from the tags). Both behaviours
@@ -24,6 +26,10 @@ Rules:
   Multi-disc albums are folded into one folder (all ``CD*``/``Disc*``
   sub-folders are dropped). Track / disc *tags* are left untouched - matching
   against the MusicBrainz release (by disc + position) keeps working.
+* Tracks living directly in a no-album bucket (``Misc/``, ``No Album/``,
+  ``Singles/``, ... - any folder matched by ``NO_ALBUM_NAMES``) are named
+  ``Artist - Title`` instead of ``d-nn - Title``: with no album to scope the
+  title, the artist has to stay in the file name to remain identifiable.
 * AIFF/MP3 counterparts are moved to the *same* relative path (extension
   swapped), including into differently named album folders - so folder names
   become identical across trees as well.
@@ -55,6 +61,8 @@ from .paths import (
     FAT_INVALID,
     FLAC_ROOT,
     MP3_ROOT,
+    NO_ALBUM_NAMES,
+    RENAME_HISTORY_PATH,
     RENAME_REPORT_PATH,
     prune_empty_dirs,
 )
@@ -143,6 +151,40 @@ def canonical_stem(path: Path, tags: dict, width: int, *,
     return f"{prefix}{number:0{width}d} - {title}"
 
 
+def loose_stem(path: Path, tags: dict, *, lowercase: bool = False) -> str | None:
+    """``Artist - Title`` for tracks living in no-album buckets (loose tracks).
+
+    Loose tracks have no album to scope the title, so the artist has to live
+    in the file name to stay identifiable - especially in mixed-artist buckets
+    like ``various artists/no album``. Falls back to title only (or the
+    existing file name) when a tag is missing.
+    """
+    artist = (tags.get("artist") or "").strip()
+    title = (tags.get("title") or "").strip()
+    if not title:
+        # keep the existing name, minus an old "NN - " / "D-NN - " prefix
+        title = re.sub(r"^\d+(?:-\d+)?\s*[-._)]\s*", "", path.stem).strip()
+    if not title:
+        return None
+    title = sanitize_name(title)
+    if not title:
+        return None
+    if artist:
+        artist = sanitize_name(artist)
+        # avoid "acopia - acopia - falter" when the fallback title already
+        # carried the artist prefix
+        if title.lower().startswith((artist + " - ").lower()):
+            title = title[len(artist) + 3:].strip()
+    if not title:
+        return None
+    if lowercase:
+        title = title.lower()
+        artist = artist.lower()
+    if artist:
+        return f"{artist} - {title}"
+    return title
+
+
 def _number_width(files: list[Path]) -> int:
     largest = 0
     for path in files:
@@ -170,6 +212,35 @@ def _counterpart(flac_file: Path, rel_key: str, flat: dict, grouped: dict) -> Pa
     if twin is not None and same_audio(flac_file, twin):
         return twin
     return None
+
+
+def _flush_rename_history(lines: list[str]) -> None:
+    """Append renames to the cumulative ``rename_history.txt``.
+
+    Keeps every generation of renames so a path from *any* earlier export can
+    be translated to the current tree (used by :mod:`relocate_rekordbox`).
+    The previous run's ``rename_report.txt`` - possibly written by an older
+    version that kept no history - is migrated in first, then this run's own
+    renames, both deduplicated so re-running is idempotent.
+    """
+    seen: set[str] = set()
+    if RENAME_HISTORY_PATH.exists():
+        seen.update(RENAME_HISTORY_PATH.read_text(encoding="utf-8").splitlines())
+    additions: list[str] = []
+    if RENAME_REPORT_PATH.exists():
+        for line in RENAME_REPORT_PATH.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and line not in seen:
+                additions.append(line)
+                seen.add(line)
+    for line in lines:
+        if line not in seen:
+            additions.append(line)
+            seen.add(line)
+    if additions:
+        RENAME_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(RENAME_HISTORY_PATH, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(additions) + "\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -202,7 +273,11 @@ def normalize_names(limit: int | None = None, dry_run: bool = False,
 
     for album_dir in tqdm(album_dirs, desc="Planning renames", unit="album"):
         files = sorted(groups[album_dir])
-        width = _number_width(files)
+        is_bucket = (
+            album_dir == FLAC_ROOT
+            or album_dir.name.lower().strip() in NO_ALBUM_NAMES
+        )
+        width = _number_width(files) if not is_bucket else 2
 
         # ---- folder name (FAT32 sanitizing + optional lowercase) ----------
         rel_parts = album_dir.relative_to(FLAC_ROOT).parts
@@ -211,27 +286,40 @@ def normalize_names(limit: int | None = None, dry_run: bool = False,
 
         # ---- per-file disc number (''-> 1 below when flattening) ----------
         file_tags = {path: read_tags(path) for path in files}
-        disc_of = {path: _file_disc(path, file_tags[path]) for path in files}
+        disc_of = (
+            {path: _file_disc(path, file_tags[path]) for path in files}
+            if not is_bucket
+            else {}
+        )
 
         for path in files:
             rel = path.relative_to(FLAC_ROOT)
             tags = file_tags[path]
-            disc = disc_of[path]
-            if flatten_discs and disc is None:
-                disc = 1  # single-disc albums / unknown discs read as disc 1
-            stem = canonical_stem(
-                path, tags, width,
-                disc=disc,
-                prefix_disc=flatten_discs,
-                lowercase=lowercase,
-            )
-            if stem is None:
-                skipped.append((path, "could not determine title"))
-                continue
 
-            new_dir = safe_album_dir
-            if not flatten_discs and path.parent != album_dir:
-                new_dir = new_dir / _fmt_component(path.parent.name, lowercase)
+            if is_bucket:
+                stem = loose_stem(path, tags, lowercase=lowercase)
+                if stem is None:
+                    skipped.append((path, "could not determine title"))
+                    continue
+                new_dir = safe_album_dir
+            else:
+                disc = disc_of[path]
+                if flatten_discs and disc is None:
+                    disc = 1  # single-disc albums / unknown discs read as disc 1
+                stem = canonical_stem(
+                    path, tags, width,
+                    disc=disc,
+                    prefix_disc=flatten_discs,
+                    lowercase=lowercase,
+                )
+                if stem is None:
+                    skipped.append((path, "could not determine title"))
+                    continue
+
+                new_dir = safe_album_dir
+                if not flatten_discs and path.parent != album_dir:
+                    new_dir = new_dir / _fmt_component(path.parent.name, lowercase)
+
             dst = new_dir / (stem + path.suffix)
             if dst != path:
                 renames.append((FLAC_ROOT, path, dst))
@@ -338,6 +426,8 @@ def normalize_names(limit: int | None = None, dry_run: bool = False,
         removed_aiff = prune_empty_dirs(AIFF_ROOT)
         removed_mp3 = prune_empty_dirs(MP3_ROOT)
         removed_flac = prune_empty_dirs(FLAC_ROOT)
+
+        _flush_rename_history(lines)
 
         if lines:
             RENAME_REPORT_PATH.write_text(

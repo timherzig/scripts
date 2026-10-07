@@ -2,6 +2,12 @@
 
 Matching strategies, in order:
 
+0. **Rename history** - if ``rename_history.txt`` (written by
+   ``normalize_names``) contains the track's path, translate it through every
+   recorded generation to the current tree and use the AIFF mirror directly.
+   This covers *all* files renamed by any previous run (incl. disc-folder
+   flattening, VA ``NN - Artist - Title`` rewrites, and loose-track naming
+   changes) - deterministically, with no name guessing.
 1. **Exact path mirror** - the MP3's relative path exists as an AIFF.
 2. **Normalized mirror** - match the MP3 against the FLAC tree by normalized
    key (bridges naming differences), then use that file's relative path in the
@@ -33,6 +39,7 @@ from .paths import (
     AIFF_ROOT,
     FLAC_ROOT,
     MP3_ROOT,
+    RENAME_HISTORY_PATH,
     REKORDBOX_UNMATCHED_PATH,
     REKORDBOX_XML_IN,
     REKORDBOX_XML_OUT,
@@ -75,6 +82,32 @@ def _build_tag_lookup(aiff_root: Path) -> dict[str, Path]:
         key = f"{sanitize(artist)}_{sanitize(title)}"
         lookup.setdefault(key, aiff_file)
     return lookup
+
+
+def load_rename_history(path: Path) -> dict[str, str]:
+    """Map old absolute path -> new absolute path from ``normalize_names``.
+
+    ``rename_history.txt`` accumulates every rename across runs, so a path
+    from any earlier generation can be chained to its current location.
+    """
+    mapping: dict[str, str] = {}
+    if not path.exists():
+        return mapping
+    for line in path.read_text(encoding="utf-8").splitlines():
+        src, sep, dst = line.partition(" -> ")
+        if sep and src.strip() and dst.strip():
+            mapping[src.strip()] = dst.strip()
+    return mapping
+
+
+def translate_path(path: Path, history: dict[str, str]) -> Path:
+    """Follow the rename history until the path is stable (no-op if unknown)."""
+    cur = path
+    seen: set[str] = set()
+    while str(cur) in history and str(cur) not in seen:
+        seen.add(str(cur))
+        cur = Path(history[str(cur)])
+    return cur
 
 
 def _find_target(
@@ -159,6 +192,10 @@ def relocate_rekordbox_xml(
     # Tag lookup is only needed for tracks outside the MP3 root; build it lazily
     tag_lookup: dict[str, Path] | None = None
 
+    history = load_rename_history(RENAME_HISTORY_PATH)
+    if history:
+        print(f"  Applying rename history ({len(history)} entries)...")
+
     stats = {"relocated": 0, "already_aiff": 0, "unmatched": 0}
     strategies: dict[str, int] = {}
     unmatched: list[str] = []
@@ -172,6 +209,7 @@ def relocate_rekordbox_xml(
 
         original = uri_to_path(location)
 
+        # already this generation's aiff: keep as-is
         if original.suffix.lower() in {".aiff", ".aif"} and original.exists():
             stats["already_aiff"] += 1
             continue
@@ -179,9 +217,34 @@ def relocate_rekordbox_xml(
         artist = track.get("Artist", "")
         title = track.get("Name", "")
 
-        target, strategy = _find_target(
-            original, flac_flat, flac_by_album, aiff_flat, aiff_by_album
-        )
+        # 0. deterministic translation through normalize's rename history
+        translated = translate_path(original, history) if history else original
+        target: Path | None = None
+        strategy = ""
+
+        if translated.suffix.lower() in {".aiff", ".aif"} and translated.exists():
+            # a renamed aiff (the export predates a normalize run): refresh path
+            if translated != original:
+                track.set("Location", path_to_uri(translated))
+            stats["already_aiff"] += 1
+            strategies["history refresh"] = strategies.get("history refresh", 0) + 1
+            continue
+
+        if translated != original:
+            # the history names the current mp3: use its aiff mirror directly
+            try:
+                rel = translated.relative_to(MP3_ROOT)
+            except ValueError:
+                rel = None
+            if rel is not None:
+                cand = AIFF_ROOT / rel.with_suffix(".aiff")
+                if cand.exists():
+                    target, strategy = cand, "history"
+
+        if target is None:
+            target, strategy = _find_target(
+                original, flac_flat, flac_by_album, aiff_flat, aiff_by_album
+            )
 
         if target is None:
             # last resort: artist + title from the AIFF's own tags (built once)
