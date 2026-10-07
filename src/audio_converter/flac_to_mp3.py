@@ -5,22 +5,7 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
-# Paths
-FLAC_ROOT = Path("/Volumes/nas/media/music/flac")
-MP3_ROOT = Path("/Volumes/nas/media/music/mp3")
-AIFF_ROOT = Path("/Volumes/nas/media/music/aiff")
-
-# Settings
-MP3_BITRATE = "320k"
-COVER_NAMES = ("cover.jpg", "cover.png", "folder.jpg")
-
-
-def find_cover(album_dir: Path) -> Path | None:
-    for name in COVER_NAMES:
-        cover = album_dir / name
-        if cover.exists():
-            return cover
-    return None
+from .paths import AIFF_ROOT, FLAC_ROOT, MP3_ROOT, MP3_BITRATE, find_cover
 
 
 def needs_update(src: Path, dst: Path, cover: Path | None) -> bool:
